@@ -230,11 +230,6 @@ export function statsRows(stats) {
   return rows;
 }
 
-/** Show in folder opens a window on the server's screen, so only offer it there. */
-export function canReveal(hostname) {
-  return ['localhost', '127.0.0.1', '[::1]', '::1'].includes(hostname);
-}
-
 /** What deleting a version removes, in words, from the server's plan: "its rig and moves, its finished model". */
 export function deletionWords(plan) {
   const part = (folder) => {

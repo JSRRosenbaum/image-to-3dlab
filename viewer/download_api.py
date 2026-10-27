@@ -43,6 +43,7 @@ from backend_catalog import (
 )
 
 from image_to_3dlab import host, processes
+from image_to_3dlab.job_admission import command_prefix as admission_prefix
 
 POLL_SECONDS = 2.0
 STALL_SECONDS = 90.0
@@ -130,6 +131,18 @@ REBUILDS: dict[str, list[str]] = {
     "pixal3d": [sys.executable, str(REPO / "scripts" / "bootstrap_pixal3d.py"),
                 "--build-only", "--rebuild", "--yes"],
 }
+
+# Only accelerator builds/probes reserve GPU; weight-only setup stays unleased.
+GPU_BUILD_BACKENDS = {
+    "trellis", "pixal3d", "sf3d", "hunyuan-cuda", "hunyuan-rocm", "qwen-image", "autorig",
+}
+
+
+def needs_gpu_admission(run: "DownloadRun") -> bool:
+    """Whether this setup command can build or probe an accelerator-capable worker."""
+    return run.backend.id in GPU_BUILD_BACKENDS
+
+
 REBUILD_MINUTES = 5
 
 
@@ -430,8 +443,10 @@ def _run(run: DownloadRun) -> None:
     else:
         threading.Thread(target=_watch_elapsed, args=(run, stop), daemon=True).start()
     try:
+        command = ([*admission_prefix(), *run.command]
+                   if needs_gpu_admission(run) else run.command)
         run.process = subprocess.Popen(
-            run.command, cwd=str(REPO),
+            command, cwd=str(REPO),
             env={**os.environ, "PYTHONUNBUFFERED": "1",
                  # The bars are unreadable in a browser and the size watcher is the real
                  # progress signal, so ask the downloader not to draw them at all.

@@ -1,3 +1,4 @@
+import { apiFetch as fetch } from './managed.js';
 // The picture guide (docs/prompt-guide.md) as a pop-up over the studio. It reads the same file
 // GitHub shows, so the guide is written once. The Markdown it needs is small: headings,
 // paragraphs, bold, links, lists, one image and a code block. No DOM in the renderer, so

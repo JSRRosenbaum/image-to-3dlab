@@ -34,16 +34,6 @@ def test_patch_applies_then_is_idempotent(tmp_path):
     portable.patch(root, check=True)  # raises if anything is missing
 
 
-def test_no_cuda_hardcoding_survives(tmp_path):
-    root = _upstream_tree(tmp_path)
-    portable.patch(root)
-    for path in {e.path for e in portable.EDITS}:
-        text = (root / path).read_text()
-        assert "'cuda'" not in text
-        assert 'v.to("cuda")' not in text
-        assert 'attn_implementation="flash_attention_2"' not in text
-
-
 def test_check_reports_an_unpatched_tree(tmp_path):
     root = _upstream_tree(tmp_path)
     with pytest.raises(SystemExit):

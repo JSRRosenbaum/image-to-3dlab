@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 # Sibling import must also work when tests load this file directly via importlib.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from completion_api import complete, host_name
 import activity_api
 import backend_catalog
 import bug_report_api
@@ -40,6 +41,7 @@ import image_api
 import model_info_api
 import preview_api
 import skins_api
+from image_to_3dlab.job_admission import command_prefix as admission_prefix
 from activity_api import ChainRunner, chain_from_form, read_history
 from assets_api import assets_payload, list_assets
 from assets_api import delete_version as delete_asset_version
@@ -730,8 +732,14 @@ def _start_setup_run(run_id: str, command: list[str] | None = None) -> SetupRun:
     """Spawn a setup script and stream its output into the run's events (SSE)."""
     run = SetupRun(run_id)
     bootstrap = REPO / "scripts" / "bootstrap_trellis_space_macos.py"
+    command = command or [sys.executable, str(bootstrap)]
+    # Only the explicit Blender and gltfpack install commands are CPU-only. The default
+    # TRELLIS bootstrap and any unknown/future command run behind admission.
+    cpu_only_command = command in (blender_install_command(), gltfpack_install_command())
+    if not cpu_only_command:
+        command = [*admission_prefix(), *command]
     proc = subprocess.Popen(
-        command or [sys.executable, str(bootstrap)],
+        command,
         cwd=str(REPO),
         env=_job_env(),
         stdout=subprocess.PIPE,
@@ -1007,9 +1015,9 @@ def _job_folder_name(image_stem: str, backend_id: str, requested: str | None) ->
     asset sweeps kept hitting on 2026-08-18 — every result had to be moved by hand
     afterward to avoid the next run silently clobbering or burying it)."""
     if requested and requested.strip():
-        return _slugify(requested)
+        return host_name(_slugify(requested))
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    return _slugify(f"{image_stem}__{backend_id}__{stamp}")
+    return host_name(_slugify(f"{image_stem}__{backend_id}__{stamp}"))
 
 
 def _safe_id(value: str) -> bool:
@@ -1462,7 +1470,9 @@ def failure_reason(log_lines, limit: int = 6) -> str | None:
 
 def _run_job(job: Job) -> None:
     spec = BACKENDS[job.backend_id]
-    args = [str(spec.interpreter), str(spec.wrapper), *spec.build_args(job)]
+    args = [
+        *admission_prefix(), str(spec.interpreter), str(spec.wrapper), *spec.build_args(job),
+    ]
     env = _job_env()
     if job.backend_id == "trellis" and spec.wrapper == WRAPPER:
         env.update(attention_backend_spec(job.settings["sparse_attn_backend"])[1])
@@ -1525,6 +1535,11 @@ def _run_job(job: Job) -> None:
         job.emit({"phase": "error", "message": str(exc)})
     finally:
         _remove_pid_file(job.directory)
+        if job.status == "done":
+            try:
+                complete(REPO / "output", job.directory)
+            except Exception as exc:
+                job.append_log(f"completion seal failed: {exc}")
         JOBS.finish(job)
 
 

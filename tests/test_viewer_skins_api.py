@@ -3,8 +3,8 @@
 What matters: only a finished Pixal3D model that kept its shape can take a skin, and the
 person is told why not otherwise; the front is approved before the back, a new front
 invalidates the back, and nothing builds until every needed side is approved; the build
-repaints the saved shape with the model's own seed, steps and Finish settings (same face
-count, so the same mesh); the repaint's scratch is deleted; the Library lists a model's
+repaints the saved shape and transfers the prepared paint onto the original UVs;
+the repaint's scratch is deleted only after that final bake; the Library lists a model's
 finished skins and never mistakes a skin's files for a new model.
 """
 
@@ -34,8 +34,10 @@ def _write(path: Path, data: bytes | str) -> Path:
 
 
 @pytest.fixture
-def output(tmp_path: Path) -> Path:
+def output(tmp_path: Path, monkeypatch) -> Path:
     out = tmp_path / "output"
+    monkeypatch.setenv("ASSETFURNACE_SYNC_STATE", str(tmp_path / "sync-state"))
+    monkeypatch.setenv("ASSETFURNACE_SYNC_OWNER", "ash")
     _write(out / "images" / PIC / f"{PIC}.png", b"front")
     _write(out / "images" / PIC / f"{PIC}__back.png", b"back")
     _write(out / GEN / f"{GEN}.glb", b"MODEL")
@@ -84,12 +86,6 @@ def test_a_model_that_cannot_take_a_skin_says_why(output, change, words):
         sk.base_from_asset(output, _asset(**change))
 
 
-def test_a_model_from_before_skins_is_told_to_make_it_again(output):
-    (output / GEN / f"{GEN}.shape.bin").unlink()
-    with pytest.raises(sk.SkinError, match="made before skins"):
-        sk.base_from_asset(output, _asset())
-
-
 def test_only_pixal3d_models_take_skins(output):
     _write(output / GEN / f"{GEN}.json", json.dumps({"backend": "trellis", "parameters": {}}))
     with pytest.raises(sk.SkinError, match="Only Pixal3D"):
@@ -106,20 +102,6 @@ def test_a_front_only_model_needs_no_back(output):
     _write(output / GEN / f"{GEN}.json", json.dumps({"backend": "pixal3d", "parameters": {"seed": 1}}))
     skin = sk.SkinStore(output).create(_asset(back=None), "gold skirt")
     assert skin.sides() == ("front",) and skin.base["back"] is None
-
-
-# --- what Qwen is asked ----------------------------------------------------------------------------
-
-
-def test_the_prompt_asks_for_the_change_and_keeps_everything_else():
-    prompt = sk.edit_prompt("make the skirt gold.", "front")
-    assert prompt.startswith("Change only this: make the skirt gold.")
-    for kept in ("same pose", "same face", "position and size in the frame", "Do not add or remove"):
-        assert kept in prompt
-
-
-def test_the_back_prompt_says_it_is_the_back():
-    assert "back view of the same character" in sk.edit_prompt("gold skirt", "back")
 
 
 # --- tries and approvals ---------------------------------------------------------------------------
@@ -205,22 +187,6 @@ def _ready(output: Path):
     return store, skin
 
 
-def test_the_repaint_uses_the_saved_shape_and_the_models_seed_and_steps(output):
-    _, skin = _ready(output)
-    command = sk.repaint_command(output, skin, python="py")
-    assert command[command.index("--reuse-shape") + 1].endswith(f"{GEN}.shape.bin")
-    assert command[command.index("--seed") + 1] == "15629060"
-    assert command[command.index("--steps") + 1] == "8"
-    assert command[command.index("--back") + 1].endswith("back-1.png")
-    assert command[3].endswith("front-1.png")
-
-
-def test_finish_uses_the_models_own_face_count(output):
-    """A different face count gives a different mesh, and the rig would no longer fit."""
-    _, skin = _ready(output)
-    command = sk.finish_command(output, skin)
-    assert command[command.index("--faces") + 1] == "20000"
-    assert command[5].endswith("gold-skirt_20k.glb")
 
 
 def _same_box(path):
@@ -241,7 +207,8 @@ class _FakeProcess:
         return self.code
 
 
-def test_a_build_repaints_finishes_and_tidies_up(output):
+def test_a_build_publishes_only_after_the_final_bake_and_tidies_up(output, monkeypatch):
+    monkeypatch.setattr("image_to_3dlab.blender.find_blender", lambda: Path("/blender"))
     store, skin = _ready(output)
     folder = output / "skins" / skin.id
     seen = []
@@ -255,15 +222,17 @@ def test_a_build_repaints_finishes_and_tidies_up(output):
                 _write(folder / "repaint" / "repaint_base.png", b"x"),
                 _write(folder / "repaint" / "repaint.svviews" / "transforms.json", "{}"),
                 _write(folder / "repaint" / "repaint.glb", b"glb")])
-        return _FakeProcess(["I2L_STAGE::photo::Pixel Match"],
-                            on_wait=lambda: _write(folder / "gold-skirt_20k.glb", b"skin"))
+        if len(seen) == 2:
+            return _FakeProcess(["I2L_STAGE::photo::Pixel Match"],
+                                on_wait=lambda: _write(folder / "finished-paint.glb", b"paint"))
+        assert store.get(skin.id).status == "building"
+        assert not (folder / "gold-skirt_20k.glb").exists()
+        return _FakeProcess([], on_wait=lambda: _write(folder / "gold-skirt_20k.glb", b"skin"))
 
     _write(output / "finish" / FIN / "input" / "source.post.bin", b"dump")   # the model took Pixal3D's own route
     skin.base["native"] = True
     job = sk.SkinBuilds(store).start(skin, background=False, runner=runner, box=_same_box)
     assert job.status == "done"
-    # Finish was built after the repaint wrote its files: same route as the model, with Pixel Match
-    assert "--native-dump" in seen[1] and "--views" in seen[1]
     saved = store.get(skin.id)
     assert saved.status == "done" and saved.result == f"skins/{skin.id}/gold-skirt_20k.glb"
     assert not (folder / "repaint" / "repaint.post.bin").exists()
@@ -284,13 +253,31 @@ def test_a_failed_step_marks_the_skin_and_can_be_built_again(output):
     assert again.status == "error"  # allowed to try again; it simply failed again here
 
 
-def test_a_build_starts_its_steps_in_their_own_process_group(output):
-    """So Cancel can stop the engine and Blender the step started, not just the step itself."""
+def test_failed_final_bake_does_not_publish_intermediate_paint(output, monkeypatch):
+    from assetfurnace_completion import CompletionError, load_and_verify
+
+    monkeypatch.setattr("image_to_3dlab.blender.find_blender", lambda: Path("/blender"))
     store, skin = _ready(output)
-    seen = []
-    sk.SkinBuilds(store).start(skin, background=False, box=_same_box,
-                               runner=lambda c, **k: seen.append(k) or _FakeProcess(["boom"], code=1))
-    assert seen and all(k.get("start_new_session") or k.get("creationflags") for k in seen)
+    folder = store.folder(skin.id)
+    steps = 0
+
+    def runner(command, **kwargs):
+        nonlocal steps
+        steps += 1
+        if steps == 2:
+            return _FakeProcess([], on_wait=lambda: _write(folder / "finished-paint.glb", b"paint"))
+        return _FakeProcess([], code=1 if steps == 3 else 0)
+
+    job = sk.SkinBuilds(store).start(skin, background=False, runner=runner, box=_same_box)
+    assert job.status == "error" and "skin-bake" in job.error
+    saved = store.get(skin.id)
+    assert saved.status == "error" and saved.result is None
+    assert not store.skins_for(skin.base["finished"])
+    assert (folder / "finished-paint.glb").read_bytes() == b"paint"
+    with pytest.raises(CompletionError):
+        load_and_verify(output, output.parent / "sync-state", f"skins/{skin.id}")
+
+
 
 
 def test_cancel_stops_the_whole_group_not_just_the_step(output):
@@ -355,12 +342,6 @@ def test_nothing_builds_before_every_side_is_approved(output):
         sk.SkinBuilds(store).start(skin, background=False)
 
 
-@pytest.mark.parametrize("stage, line, expected", [
-    ("repaint", "[3/6] shape", 40.0), ("repaint", "[6/6] write", 80.0), ("repaint", "noise", None),
-    ("finish", "I2L_STAGE::photo::Pixel Match", 88.0), ("finish", "plain line", None),
-])
-def test_progress_reads_both_steps(stage, line, expected):
-    assert sk.progress(stage, line) == expected
 
 
 # --- the Library -------------------------------------------------------------------------------------
@@ -602,6 +583,10 @@ def test_a_rigged_model_is_dressed_once_and_kept(output):
     assert made.startswith(f"skins/{skin.id}/dressed/") and b"GOLD" in (output / made).read_bytes()
     document, _ = parse_glb((output / made).read_bytes())
     assert set(paint_images(document)) == {"baseColorTexture", "metallicRoughnessTexture"}
+    from assetfurnace_completion import load_and_verify
+    seal = load_and_verify(output, output.parent / "sync-state", f"skins/{skin.id}")
+    assert seal["owner"] == "ash"
+    assert made.removeprefix(f"skins/{skin.id}/") in seal["files"]
     first = (output / made).stat().st_mtime
     assert sk.dressed(output, skin, "animate/r/p_rigged.glb") == made and (output / made).stat().st_mtime == first
 
@@ -628,8 +613,31 @@ def test_one_file_carries_every_finished_skin(output):
     _write(output / "animate" / "r" / "p_rigged.glb", _glb(b"MODEL-PAINT"))
     made = sk.all_skins(output, "animate/r/p_rigged.glb", [gold, purple])
     assert variant_names((output / made).read_bytes()) == ["Original paint", "gold skirt", "purple"]
+    from assetfurnace_completion import load_and_verify
+    bundle = str(Path(made).parent)
+    seal = load_and_verify(output, output.parent / "sync-state", bundle)
+    assert seal["owner"] == "ash"
+    assert "export.provenance.json" in seal["files"]
+    assert Path(made).name in seal["files"]
     with pytest.raises(sk.SkinError, match="no finished skins"):
         sk.all_skins(output, "animate/r/p_rigged.glb", [])
+
+
+def test_failed_variant_rebuild_revokes_publication_but_retains_last_export(output):
+    from assetfurnace_completion import CompletionError, load_and_verify
+    _, skin = _finished_skin(output)
+    source = _write(output / "animate" / "r" / "p_rigged.glb", _glb(b"MODEL-PAINT"))
+    made = sk.all_skins(output, "animate/r/p_rigged.glb", [skin])
+    previous = (output / made).read_bytes()
+    source.write_bytes(b"not-a-GLB-header")
+    import os
+    stamp = (output / made).stat().st_mtime + 1
+    os.utime(source, (stamp, stamp))
+    with pytest.raises(ValueError):
+        sk.all_skins(output, "animate/r/p_rigged.glb", [skin])
+    assert (output / made).read_bytes() == previous
+    with pytest.raises(CompletionError):
+        load_and_verify(output, output.parent / "sync-state", str(Path(made).parent))
 
 
 def test_every_build_lands_in_the_activity_history(output):

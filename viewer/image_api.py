@@ -41,10 +41,13 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from image_to_3dlab import back_view, matte
+from image_to_3dlab.job_admission import command_prefix as admission_prefix
 from image_to_3dlab.host import APPLE, executable, host_platform, with_rocm_libraries
 from image_to_3dlab.provenance import LICENSES, QWEN_OUTPUT_RIGHTS
 from image_to_3dlab.sdcpp import BackendWatch, no_gpu_help
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from completion_api import complete, host_name, revoke
 HF_HUB = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
 BINARY = executable(REPO / "vendor" / "sdcpp", "sd-cli")
 # Every picture lands in output/images/. Its licence (Qwen's research licence, today) is
@@ -79,7 +82,7 @@ DEFAULTS: dict[str, Any] = {
     "negative_prompt": "",
 }
 
-SAMPLERS = ("euler", "euler_a", "heun", "dpm2", "dpmpp2m", "lcm")
+SAMPLERS = ("euler", "euler_a", "heun", "dpm2", "dpm++2m", "lcm")
 # sd.cpp requires both dimensions to be a multiple of 32; anything else fails deep in the
 # run rather than at the door.
 SIZE_STEP = 32
@@ -253,7 +256,7 @@ def failure_reason(log_lines) -> str | None:
     """
     for line in reversed(list(log_lines)):
         text = line.strip()
-        if not text or PROGRESS.search(text):
+        if not text or PROGRESS.search(text) or text == "Waiting for Canopy GPU admission...":
             continue
         return text
     return None
@@ -288,7 +291,7 @@ def provenance(prompt: str, settings: dict[str, Any], seconds: float,
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "model": {
             "id": MODEL_ID,
-            "runtime": "stable-diffusion.cpp (Metal)",
+            "runtime": "stable-diffusion.cpp",
             "weights": weight_manifest(),
         },
         "license": {
@@ -378,7 +381,7 @@ class ImageJobManager:
                     raise RuntimeError("an image is already being generated")
             if output_path is None:
                 stamp = time.strftime("%Y%m%d-%H%M%S")
-                name = f"{slug(prompt)}__{stamp}"
+                name = host_name(f"{slug(prompt)}__{stamp}")
                 output_path = self.output_root / name / f"{name}.png"
             directory = output_path.parent
             directory.mkdir(parents=True, exist_ok=True)
@@ -418,6 +421,8 @@ def create_back_job(manager: ImageJobManager, front: Path, seed: int = 3) -> Ima
     test of 2026-10-12.
     """
     from PIL import Image
+    if front.parent != OUTPUT_ROOT / "uploads":
+        revoke(REPO / "output", front.parent)
 
     with Image.open(front) as opened:
         cut = opened.convert("RGBA") if matte.is_matted(opened) else matte.cut_out(
@@ -450,7 +455,7 @@ def run_job(job: ImageJob, manager: ImageJobManager,
         job.set_status("running", total_steps=job.settings["steps"])
         started = time.monotonic()
         job.process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            [*admission_prefix(), *command], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             cwd=str(REPO), env=with_rocm_libraries(dict(os.environ)),
         )
         assert job.process.stdout is not None
@@ -515,8 +520,12 @@ def run_job(job: ImageJob, manager: ImageJobManager,
         job.error = f"{type(exc).__name__}: {exc}"
         job.set_status("error", error=job.error)
     finally:
+        if job.status == "done" and job.directory.parent == OUTPUT_ROOT and job.directory.name != "uploads":
+            try:
+                complete(REPO / "output", job.directory)
+            except Exception as exc:
+                job.log_lines.append(f"completion seal failed: {exc}")
         manager.finish(job)
-
 
 MANAGER = ImageJobManager()
 

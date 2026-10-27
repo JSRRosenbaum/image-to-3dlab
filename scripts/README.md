@@ -178,6 +178,7 @@ Heavier edits that need Blender's own operators rather than trimesh.
 | `blender_bake_ao.py` | Bake an ambient-occlusion map from an asset's own geometry, headless. |
 | `blender_bake_normals.py` | Bake TRELLIS' discarded high-poly detail into a normal map for the low-poly mesh. |
 | `blender_bake_detail.py` | Bake the original's surface detail onto a finished mesh: normal map + metallic-roughness. |
+| `blender_bake_skin.py` | Bake a repaint onto the original Finish UVs, publishing only new paint images. |
 
 ## Rig and animate
 

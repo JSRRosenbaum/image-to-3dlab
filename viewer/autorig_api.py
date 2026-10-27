@@ -41,7 +41,10 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from image_to_3dlab import host, processes
+from image_to_3dlab.job_admission import command_prefix as admission_prefix
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from completion_api import complete, host_name, revoke
 OUTPUT_ROOT = REPO / "output" / "animate"
 SKINTOKENS = REPO / "vendor" / "SkinTokens"
 RETARGET = REPO / "scripts" / "kimodo_retarget.py"
@@ -313,7 +316,7 @@ class AnimateJobManager:
         with self.lock:
             if self.busy():
                 raise RuntimeError("an Animate job is already running")
-            stem = _slug(Path(name).stem)
+            stem = host_name(_slug(Path(name).stem))
             stamp = time.strftime("%Y%m%d-%H%M%S")
             directory = self.output_root / f"{stem}__rig__{stamp}"
             suffix = 2
@@ -347,6 +350,7 @@ class AnimateJobManager:
             record = animation_record(_read_json(rigged.with_suffix(".provenance.json")),
                                       preset, spread)
             record["motion"]["speed"] = pace
+            revoke(REPO / "output", run)
             job = AnimateJob(uuid.uuid4().hex, "animate", run, result,
                              [(animate_command(rigged, self.motions / f"{preset_id}.npz",
                                                result, spread, pace), REPO)],
@@ -393,7 +397,7 @@ def run_job(job: AnimateJob, manager: AnimateJobManager = ANIMATE_JOBS) -> None:
         code = 0
         for command, cwd in job.commands:
             job.process = subprocess.Popen(
-                command, cwd=str(cwd),
+                [*admission_prefix(), *command], cwd=str(cwd),
                 env={**os.environ, "PYTHONUNBUFFERED": "1", "HF_HUB_OFFLINE": "1"},
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
                 **processes.group_popen_kwargs(),
@@ -434,8 +438,12 @@ def run_job(job: AnimateJob, manager: AnimateJobManager = ANIMATE_JOBS) -> None:
         job.emit({"phase": "error", "message": str(exc)})
     finally:
         stop.set()
+        if job.status == "done":
+            try:
+                complete(REPO / "output", job.directory)
+            except Exception as exc:
+                job.append_log(f"completion seal failed: {exc}")
         manager.finish(job)
-
 
 def cancel_job(job: AnimateJob) -> None:
     if job.status in TERMINAL:

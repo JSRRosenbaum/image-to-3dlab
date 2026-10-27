@@ -1,3 +1,4 @@
+import { apiFetch as fetch } from './managed.js';
 // Skins: new paint on a finished Pixal3D model, same mesh underneath (viewer/skins_api.py).
 // One card under the steps: pick a skin to view, or make one. The person approves the new
 // front picture, then the back, before anything is painted; asking again takes a correction.
@@ -146,7 +147,7 @@ export async function mountSkins(list, asset, ctx) {
     e.target.disabled = true;
     const file = asset.rigged || asset.finished;
     try {
-      const made = await call(`/api/skins/all?asset=${encodeURIComponent(asset.id)}&file=${encodeURIComponent(file)}`);
+      const made = await call('/api/skins/all', { asset: asset.id, file });
       const link = Object.assign(document.createElement('a'), { href: ctx.url(made.file), download: made.file.split('/').pop() });
       document.body.appendChild(link); link.click(); link.remove();
     } catch (error) { note(error.message); }

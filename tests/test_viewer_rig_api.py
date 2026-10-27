@@ -81,8 +81,30 @@ def test_stage_lines_become_stable_progress_events():
     assert rig_api._stage_event("ordinary Blender output") is None
 
 
-def test_runner_records_a_pid_for_server_restart_reconciliation():
-    source = Path(rig_api.__file__).read_text()
+def test_rebind_runtime_override_does_not_change_other_blender_consumers(tmp_path, monkeypatch):
+    from image_to_3dlab.blender import find_blender
+    finish = tmp_path / "finish-blender"
+    rebind = tmp_path / "rigify-blender"
+    finish.touch()
+    rebind.touch()
+    monkeypatch.setenv("I2L_BLENDER", str(finish))
+    monkeypatch.setenv("I2L_REBIND_BLENDER", str(rebind))
+    assert rig_api.blender_executable() == rebind
+    assert find_blender() == finish
 
-    assert 'joinpath("pid").write_text' in source
-    assert 'joinpath("pid").unlink(missing_ok=True)' in source
+
+@pytest.mark.parametrize("configured", ["", "missing-blender"])
+def test_bad_explicit_rebind_runtime_never_falls_back(tmp_path, monkeypatch, configured):
+    finish = tmp_path / "finish-blender"
+    finish.touch()
+    monkeypatch.setenv("I2L_BLENDER", str(finish))
+    monkeypatch.setenv("I2L_REBIND_BLENDER", str(tmp_path / configured) if configured else "")
+    assert rig_api.blender_executable() is None
+
+
+def test_unconfigured_rebind_retains_native_blender_selection(tmp_path, monkeypatch):
+    finish = tmp_path / "native-blender"
+    finish.touch()
+    monkeypatch.setenv("I2L_BLENDER", str(finish))
+    monkeypatch.delenv("I2L_REBIND_BLENDER", raising=False)
+    assert rig_api.blender_executable() == finish

@@ -40,8 +40,11 @@ from rig_api import blender_executable
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 from image_to_3dlab import processes
+from image_to_3dlab.job_admission import command_prefix as admission_prefix
 from image_to_3dlab.blender import missing_help
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from completion_api import complete, host_name, revoke
 OUTPUT_ROOT = REPO / "output" / "props"
 SPLITTER = REPO / "scripts" / "blender_split_props.py"
 FINISHER = REPO / "scripts" / "finish_props.py"
@@ -453,7 +456,7 @@ class PropsJobManager:
         with self.lock:
             self._refuse_if_busy()
             clean = normalise_settings(settings)
-            stem = _slug(Path(asset_name).stem)
+            stem = host_name(_slug(Path(asset_name).stem))
             stamp = time.strftime("%Y%m%d-%H%M%S")
             directory = self.output_root / f"{stem}__props__{stamp}"
             suffix = 2
@@ -512,6 +515,7 @@ class PropsJobManager:
             # that stayed recorded made the next click turn the prop twice (seen
             # 2026-09-25, a barrel that came out facing backwards).
             self.jobs[job.id] = job
+            revoke(REPO / "output", directory)
             self.active = job.id
             return job
 
@@ -586,6 +590,11 @@ def run_job(job: PropsJob, manager: PropsJobManager = PROPS_JOBS) -> None:
         if job.only:
             shutil.rmtree(job.staging, ignore_errors=True)
         job.directory.joinpath("pid").unlink(missing_ok=True)
+        if job.status == "done":
+            try:
+                complete(REPO / "output", job.directory)
+            except Exception as exc:
+                job.emit({"phase": "warning", "message": f"completion seal failed: {exc}"})
         manager.finish(job)
 
 
@@ -665,8 +674,9 @@ def _run_step(job: PropsJob, label: str, command: list[str], feed) -> bool:
     if job.cancel_requested:
         _cancelled(job)
         return False
+    worker_command = [*admission_prefix(), *command]
     job.process = subprocess.Popen(
-        command, cwd=str(REPO), env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        worker_command, cwd=str(REPO), env={**os.environ, "PYTHONUNBUFFERED": "1"},
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         **processes.group_popen_kwargs(),
     )

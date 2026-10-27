@@ -599,9 +599,23 @@ def install_code(version: tuple[int, int], route: str = "source") -> None:
     BUILT_MARKER.write_text(json.dumps(record) + "\n")
 
 
+def _encoder_cached() -> bool:
+    """A retained encoder needs no new remote download authorization."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+    except ImportError:
+        return False
+
+    required = ("config.json", "model.safetensors", "preprocessor_config.json", "LICENSE.md")
+    return all(isinstance(try_to_load_from_cache(GATED, name), str) for name in required)
+
+
 def check_access(repo: str = GATED) -> None:
     """Raise GatedAccess when Hugging Face will refuse the gated encoder. Seconds, no
     download: better than finding out after a 16 GB fetch and half an hour of compiling."""
+    if repo == GATED and _encoder_cached():
+        print("Reusing the retained local DINOv3 encoder; no gated download needed.")
+        return
     try:
         from huggingface_hub import auth_check
         from huggingface_hub.utils import GatedRepoError
@@ -622,6 +636,9 @@ def install_weights() -> None:
         raise SystemExit("huggingface_hub is not installed. pip install -r requirements.txt"
                          ) from exc
     for repo, patterns, size in WEIGHTS:
+        if repo == GATED and _encoder_cached():
+            print("\nReusing the retained local DINOv3 encoder.", flush=True)
+            continue
         print(f"\nFetching {repo} ({size:.2f} GB)...", flush=True)
         try:
             snapshot_download(repo, allow_patterns=patterns)

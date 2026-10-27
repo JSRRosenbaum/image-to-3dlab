@@ -1,3 +1,4 @@
+import { apiFetch as fetch, apiUrl } from './managed.js';
 // --- Setup & Status -------------------------------------------------------------------
 // What is installed, what it would cost to install the rest, and the only place a download
 // can be started. Reads GET /api/catalog (viewer/backend_catalog.py).
@@ -319,7 +320,7 @@ function resume(run) {
 
 function watch(payload) {
   state.source?.close();
-  state.source = new EventSource(payload.events_url);
+  state.source = new EventSource(apiUrl(payload.events_url));
   state.source.onmessage = (message) => applyEvent(JSON.parse(message.data));
   s('setup-run-cancel').onclick = async () => {
     await fetch(`/api/setup/${encodeURIComponent(state.running)}/cancel`, { method: 'POST' });
@@ -569,7 +570,7 @@ async function blenderCard() {
         const response = await fetch('/api/blender/install', { method: 'POST' });
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-        const source = new EventSource(payload.events_url);
+        const source = new EventSource(apiUrl(payload.events_url));
         source.onmessage = (message) => {
           const event = JSON.parse(message.data);
           if (event.message) progress.textContent = event.message;
@@ -629,7 +630,7 @@ async function gltfpackCard() {
         const response = await fetch('/api/gltfpack/install', { method: 'POST' });
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-        const source = new EventSource(payload.events_url);
+        const source = new EventSource(apiUrl(payload.events_url));
         source.onmessage = (message) => {
           const event = JSON.parse(message.data);
           if (event.message) progress.textContent = event.message;

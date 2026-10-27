@@ -1,3 +1,4 @@
+import { apiFetch as fetch } from './managed.js';
 // Create: one sheet that asks "start from" and "I want", then a runner that carries one
 // thing through every step it needs, using the same job APIs as the Steps panel.
 
@@ -110,7 +111,7 @@ export function openCreate({ stage, recipes, engines, presets, frontBack = null,
         </div></details>` : ''}
       ${active.includes('model') ? `<details class="adv"><summary>Advanced: 3D model</summary>${engines.length > 1 ? `<label class="field">Engine<select data-k="engine">${engines.map((e, i) => `<option value="${esc(e.id)}" ${e.id === state.engine ? 'selected' : ''}>${i ? '' : 'Best quality: '}${esc(e.label)}</option>`).join('')}</select></label>` : ''}${pixal && state.want !== 'set' ? (frontBack?.ready ? `<label class="check"><input type="checkbox" data-k="frontback" ${state.frontBack ? 'checked' : ''}><span>Front + back <span class="hint">draws the back too, so the sides and back match your picture instead of being guessed. A few minutes more on a Mac, under a minute on a Linux GPU.</span></span></label>` : frontBack?.hint ? `<p class="hint">Front + back is off. ${esc(frontBack.hint)}</p>` : '') : ''}<label class="check"><input type="checkbox" data-k="keep" ${state.keep ? 'checked' : ''}><span>Keep everything <span class="hint">textures, in-between meshes and resume files, for digging into a bad result. Takes a lot more disk.</span></span></label></details>` : ''}
       <p class="error" data-error hidden></p>
-      <div class="row end"><span class="hint">${active.length} step${active.length === 1 ? '' : 's'}${active.includes('picture') ? ' · the picture uses Qwen-Image, run on this machine' : ''}</span><button type="submit" class="primary">Make it</button></div>
+      <div class="row end"><span class="hint">${active.length} step${active.length === 1 ? '' : 's'} · managed worker availability is checked before starting</span><button type="submit" class="primary">Make it</button></div>
     </form>`;
     wire(active);
   };

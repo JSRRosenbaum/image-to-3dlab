@@ -8,20 +8,22 @@ without being built twice: engines, moves and the prompt wording are read from t
 each call, and `tests/test_mcp_server.py` fails when the server grows an action that is
 neither offered here nor listed in `STUDIO_ONLY` with a reason.
 
-If the studio is not running, the first tool call starts it in the background (it is
-never restarted: a run in progress belongs to whoever started it).
+The managed studio must already be reachable through Canopy. Connection failure never
+starts a local execution server, including when the connection is a loopback SSH tunnel.
 """
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import mimetypes
 import os
 import re
-import subprocess
 import sys
 import time
-import webbrowser
+import uuid
+from urllib.parse import urlsplit
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -30,8 +32,7 @@ from image_to_3dlab import __version__
 from image_to_3dlab.agent_plan import compose_prompt, plan_for, refusal, stop_after
 
 REPO = Path(__file__).resolve().parents[1]
-DEFAULT_URL = "http://127.0.0.1:8777"
-START_TIMEOUT = 30
+DEFAULT_URL = "http://127.0.0.1:9292/upstream/assetfurnace"
 WAIT_LIMIT = 50           # an MCP call should come back well inside the clients' own timeouts
 STEP_IDS = ("picture", "back", "model", "finished", "split", "rigged", "animated")
 
@@ -66,9 +67,10 @@ STUDIO_ONLY = {
     "api/generate/*/cancel": "via cancel_run", "api/finish/*/cancel": "via cancel_run",
     "api/props/*/cancel": "via cancel_run", "api/image/*/cancel": "via cancel_run",
     "api/animate/*/cancel": "via cancel_run", "api/rig/rebind/*/cancel": "via cancel_run",
+    "api/reveal": "opens a path on the execution host; only the user's local desktop can reveal a file",
 }
 # Server actions the tools below call.
-USED = {"api/chains", "api/chains/*/cancel", "api/setup/*/download", "api/reveal", "api/bug-report",
+USED = {"api/chains", "api/chains/*/cancel", "api/setup/*/download", "api/bug-report",
         "api/skins", "api/skins/*/try", "api/skins/*/approve", "api/skins/*/build", "api/skins/build/*/cancel"}
 
 
@@ -78,49 +80,34 @@ class StudioError(RuntimeError):
 
 # --------------------------------------------------------------------------- the studio
 class Studio:
-    """HTTP to the studio server, starting it once if nobody has."""
+    """Managed studio client with a durable, no-replay mutation journal."""
 
-    def __init__(self, base: str | None = None, *, http=None, start: Callable[[], None] | None = None):
+    def __init__(self, base: str | None = None, *, http=None, journal: Path | None = None):
         self.base = (base or os.environ.get("ASSETFURNACE_URL") or DEFAULT_URL).rstrip("/")
         if http is None:
             import requests
             http = requests.Session()
         self.http = http
-        self._start = start or self._start_server
         self._checked = False
+        identity = hashlib.sha256(self.base.encode()).hexdigest()[:20]
+        state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+        self.journal = journal or state / "assetfurnace" / f"managed-{identity}.json"
 
-    # -- plumbing
     def _url(self, path: str) -> str:
+        parsed = urlsplit(self.base)
+        if parsed.path and path.startswith(parsed.path.rstrip("/") + "/"):
+            return f"{parsed.scheme}://{parsed.netloc}{path}"
         return f"{self.base}/{path.lstrip('/')}"
 
     def _ensure(self) -> None:
-        if self._checked:
-            return
-        if not self._alive():
-            self._start()
-            deadline = time.time() + START_TIMEOUT
-            while not self._alive():
-                if time.time() > deadline:
-                    raise StudioError(f"The studio did not start at {self.base}. Start it with ./lab and try again.")
-                time.sleep(0.5)
-        self._checked = True
-
-    def _alive(self) -> bool:
-        try:
-            return self.http.get(self._url("api/catalog"), timeout=5).status_code == 200
-        except Exception:
-            return False
-
-    def _start_server(self) -> None:
-        if not self.base.startswith(("http://127.0.0.1", "http://localhost")):
-            raise StudioError(f"No studio answers at {self.base}, and it is not this machine, so it can't be started from here.")
-        log = REPO / "output" / ".studio-mcp.log"
-        log.parent.mkdir(parents=True, exist_ok=True)
-        port = self.base.rsplit(":", 1)[-1]
-        with log.open("ab") as out:
-            subprocess.Popen([sys.executable, str(REPO / "viewer" / "serve.py"), "--no-browser", "--port", port],
-                             cwd=REPO, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                             start_new_session=True)
+        if not self._checked:
+            try:
+                response = self.http.get(self._url("api/graft/capabilities"), timeout=30)
+                if response.status_code != 200 or response.json().get("managed") is not True:
+                    raise StudioError("endpoint is not the managed AssetFurnace control")
+            except Exception as exc:
+                raise StudioError(f"Managed AssetFurnace unavailable at {self.base}; no local worker was started: {exc}") from exc
+            self._checked = True
 
     def _check(self, response) -> Any:
         if response.status_code >= 400:
@@ -139,16 +126,72 @@ class Studio:
         self._ensure()
         return self._check(self.http.get(self._url(path), params=params or None, timeout=timeout))
 
-    def post(self, path: str, *, data=None, files=None) -> Any:
-        """POST as multipart (the only form the studio's plan endpoint reads)."""
+    def _save(self, value) -> None:
+        temporary = self.journal.with_suffix(".new")
+        with temporary.open("w") as stream:
+            json.dump(value, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, self.journal)
+        descriptor = os.open(self.journal.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _reconcile(self, pending):
+        deadline = time.monotonic() + WAIT_LIMIT
+        while True:
+            try:
+                response = self.http.get(self._url("api/graft/requests/" + pending["id"]), timeout=15)
+                value = response.json() if response.status_code == 200 else {}
+            except Exception:
+                value = {}
+            if value.get("graft", {}).get("job_id") == pending["id"]:
+                if value.get("response") is not None:
+                    self._save(None)
+                    native = value["response"]
+                    if native["status"] >= 400:
+                        raise StudioError(native["body"].get("error", "native operation failed"))
+                    return {**native["body"], "graft": value["graft"]}
+                if value["graft"]["state"] == "rejected":
+                    self._save(None)
+                    raise StudioError(value.get("error") or "No compatible worker accepted this request.")
+            if time.monotonic() >= deadline:
+                raise StudioError(f"Request {pending['id']} remains uncertain. Reconcile its original identity; no POST was replayed.")
+            time.sleep(0.5)
+
+    def _post(self, path, **kwargs):
         self._ensure()
+        if path.strip("/") == "api/reveal":
+            raise StudioError("Remote show-in-folder is unavailable. Download the artifact locally.")
+        self.journal.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with self.journal.with_suffix(".lock").open("a") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            pending = json.loads(self.journal.read_text()) if self.journal.exists() else None
+            if pending:
+                result = self._reconcile(pending)
+                raise StudioError("Earlier request reconciled; review its result before starting new work: " + json.dumps(result))
+            pending = {"id": str(uuid.uuid4()), "path": path, "created": time.time()}
+            self._save(pending)
+            try:
+                response = self.http.post(self._url(path), headers={"X-Graft-Request-ID": pending["id"]}, timeout=60, **kwargs)
+                value = response.json()
+                if value.get("graft", {}).get("job_id") == pending["id"] and "response" not in value:
+                    self._save(None)
+                    return self._check(response).json()
+            except StudioError:
+                raise
+            except Exception:
+                pass  # Uncertain transport is resolved by GET only.
+            return self._reconcile(pending)
+
+    def post(self, path: str, *, data=None, files=None) -> Any:
         parts = {k: (None, v) for k, v in (data or {}).items()} | (files or {})
-        return self._check(self.http.post(self._url(path), files=parts or None, timeout=60)).json()
+        return self._post(path, files=parts or None)
 
     def post_json(self, path: str, body: dict[str, Any]) -> Any:
-        """POST a small JSON body, the form the studio's per-asset actions read."""
-        self._ensure()
-        return self._check(self.http.post(self._url(path), json=body, timeout=60)).json()
+        return self._post(path, json=body)
 
     def studio_link(self, asset_id: str | None = None) -> str:
         return f"{self.base}/viewer/studio.html" + (f"#asset={asset_id}" if asset_id else "")
@@ -679,35 +722,31 @@ def preview(studio: Studio, *, asset_id: str, stage: str = "latest", look: str =
     params = ({"asset": asset_id, "stage": stage, "look": look} | ({"move": move} if move else {})
               | ({"skin": skin} if skin else {}))
     response = studio.get_bytes("api/preview", **params)
-    path = REPO / "output" / response.headers.get("X-Preview-Path", "")
     return response.content, {
         "shown": response.headers.get("X-Preview-Stage", stage),
-        "file": str(path) if path.is_file() else None,
         "studio": studio.studio_link(asset_id),
-        "tip": "Show the user this picture, or open_in_studio so they can spin it round themselves.",
+        "tip": "Show the user this picture, or open the managed studio link so they can spin it round themselves.",
     }
 
 
-def open_in_studio(studio: Studio, *, asset_id: str | None = None,
-                   opener: Callable[[str], bool] = webbrowser.open) -> dict[str, Any]:
+def open_in_studio(studio: Studio, *, asset_id: str | None = None) -> dict[str, Any]:
     if asset_id:
         find_asset(studio, asset_id)
     else:
-        studio.get("api/catalog")  # starts the studio if it isn't running
+        studio._ensure()
     link = studio.studio_link(asset_id)
-    opened = opener(link)
-    return {"opened": bool(opened), "link": link}
+    return {"opened": False, "link": link,
+            "note": "The managed studio link is ready; open it in the user's browser. No browser was opened on the MCP host."}
 
 
 def model_info(studio: Studio, *, asset_id: str, stage: str = "latest") -> dict[str, Any]:
     info = studio.get("api/model-info", asset=asset_id, stage=stage)
     return info | {"tip": "Counts are triangles: GLB files store no quads, so there is no quad count. "
-                          "path is the file on this machine; show_in_folder opens it for the user."}
+                          "path is a managed download URL, not a file on this computer."}
 
 
 def show_in_folder(studio: Studio, *, asset_id: str, stage: str = "latest") -> dict[str, Any]:
-    file = studio.get("api/model-info", asset=asset_id, stage=stage)["file"]
-    return studio.post_json("api/reveal", {"file": file})
+    raise StudioError("Remote show-in-folder is unavailable. Download the model locally from its managed link.")
 
 
 def report_bug(studio: Studio, *, message: str, include_prompt: bool = False) -> dict[str, Any]:
@@ -753,8 +792,8 @@ def install_backend(studio: Studio, *, backend_id: str, confirm: bool = False) -
 # --------------------------------------------------------------------------- the server
 def skin_summary(state: dict[str, Any]) -> dict[str, Any]:
     """A skin in short: its pictures (files the agent can show), what is approved, what to do next."""
-    tries = {side: [{"number": t["number"], "change": t["instruction"], "file": f"output/{t['picture']}",
-                     "ready": (REPO / "output" / t["picture"]).is_file()} for t in state["tries"].get(side, [])]
+    tries = {side: [{"number": t["number"], "change": t["instruction"], "file": f"output/{t['picture']}"}
+                    for t in state["tries"].get(side, [])]
              for side in ("front", "back")}
     picture_job = state.get("picture_job") or {}
     build = state.get("build_job") or {}
@@ -808,13 +847,14 @@ def skin_picture(studio: Studio, *, skin_id: str, side: str = "front", number: i
     chosen = next((t for t in tries if t["number"] == number), None) if number else (tries[-1] if tries else None)
     if chosen is None:
         raise StudioError(f"There is no {side} picture for this skin yet.")
-    path = REPO / "output" / chosen["picture"]
-    if not path.is_file():
+    if (state.get("picture_job") or {}).get("status") in ("queued", "running"):
         raise StudioError(f"The {side} picture is still being drawn: call skin_status(wait_seconds=50).")
+    file = f"output/{chosen['picture']}"
+    response = studio.get_bytes(file)
     original = state["base"].get(side)
-    return path.read_bytes(), {"side": side, "number": chosen["number"], "change": chosen["instruction"],
-                               "file": str(path), "original": f"output/{original}" if original else None,
-                               "approved": state["approved"].get(side) == chosen["picture"]}
+    return response.content, {"side": side, "number": chosen["number"], "change": chosen["instruction"],
+                              "file": file, "original": f"output/{original}" if original else None,
+                              "approved": state["approved"].get(side) == chosen["picture"]}
 
 
 def approve_skin_picture(studio: Studio, *, skin_id: str, side: str = "front", number: int | None = None) -> dict[str, Any]:
@@ -840,7 +880,7 @@ def export_skins(studio: Studio, *, asset_id: str, skin_id: str | None = None) -
         raise StudioError("This model has no finished skins yet: make_skin makes one.")
     if skin_id is None:
         file = asset.get("rigged") or asset.get("finished")
-        made = studio.get("api/skins/all", asset=asset_id, file=file)
+        made = studio.post_json("api/skins/all", {"asset": asset_id, "file": file})
         return {"file": f"output/{made['file']}", "skins": [k["name"] for k in asset["skins"]],
                 "tip": "One GLB: Blender, three.js and <model-viewer> list the skins as material variants."}
     if not any(k["id"] == skin_id for k in asset["skins"]):
@@ -848,7 +888,7 @@ def export_skins(studio: Studio, *, asset_id: str, skin_id: str | None = None) -
     files = {"finished": next(k["file"] for k in asset["skins"] if k["id"] == skin_id)}
     for key, source in ([("rigged", asset.get("rigged"))] + [(c["name"], c["file"]) for c in asset.get("clips", [])]):
         if source:
-            files[key] = studio.get(f"api/skins/{skin_id}/dressed", file=source)["file"]
+            files[key] = studio.post_json(f"api/skins/{skin_id}/dressed", {"file": source})["file"]
     return {"files": {k: f"output/{v}" for k, v in files.items()}}
 
 
@@ -860,7 +900,7 @@ def cancel_skin(studio: Studio, *, skin_id: str) -> dict[str, Any]:
     return {"cancelled": bool(result.get("cancelled")), "note": "The approved pictures are kept."}
 
 
-INSTRUCTIONS = """AssetFurnace makes game-ready 3D assets on this machine: a picture or an idea becomes a
+INSTRUCTIONS = """AssetFurnace makes game-ready 3D assets through Grove's managed workers: a picture or an idea becomes a
 3D model, then a finished game-ready model, then a rigged and animated character. Runs take minutes
 (a 3D model is ~5-15 min), one at a time. Typical flow: status -> create -> run_status (wait) ->
 list_assets -> preview (show the user the picture) -> open_in_studio if they want to look closer.
@@ -1050,14 +1090,13 @@ def build_server(studio: Studio | None = None):
 
     @server.tool(name="open_in_studio", structured_output=False)
     def tool_open_in_studio(asset_id: str | None = None):
-        """Open the studio in the user's browser, on this asset, so they can spin it, play its moves and
-        download it. Without an asset_id it opens the studio's front page."""
+        """Return the managed studio link for the user to open in their browser. No browser is opened on the MCP host."""
         return safe(lambda: open_in_studio(studio, asset_id=asset_id))
 
     @server.tool(name="model_info", structured_output=False)
     def tool_model_info(asset_id: str, stage: str = "latest"):
         """A model's numbers and where its file is: triangles, vertices, textures (with sizes), materials,
-        bones, moves and file size, plus the full path on this machine. stage: latest | model | finished |
+        bones, moves and file size, plus its managed download URL. stage: latest | model | finished |
         rigged (picture gives the path but no counts)."""
         return safe(lambda: model_info(studio, asset_id=asset_id, stage=stage))
 

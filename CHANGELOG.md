@@ -8,9 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Grove managed connection.** Studio and MCP use one Canopy application URL;
+  durable request identities reconcile lost replies without replay or local worker autostart.
+  Native Graft workers retain existing engines and use canonical job admission, with
+  capability-appropriate placement, explicit preacceptance fallback, and job/chain/asset-owner affinity.
+  Activation uses a bounded, reversible runtime-owner window; unavailable native operations
+  report their capability limits rather than substituting another engine.
 - **`lab` on Windows.** Start the studio with `.\lab`, the same as `./lab` on Mac and Linux.
 
 ### Fixed
+- **Skin UV preservation.** Finish prepares paint but no longer supplies the skin's final
+  geometry. A CPU Blender bake transfers colour and metallic-roughness onto the original
+  UV atlas; publication retains the original mesh, normal map, and material factors.
+  Differing retopology no longer corrupts dressed rigs or animated material variants.
+  Unsupported multi-atlas/UV-transform inputs fail explicitly before publication.
+- **Native rig cancellation.** SkinTokens' Blender helper stays in the admitted job's POSIX
+  process group; normal exit waits for helper termination before the job releases its lease.
+- **Native image provenance.** Record the stable-diffusion.cpp runtime without incorrectly
+  claiming every platform uses Metal.
+- **Native Qwen sampler selection.** Use sd-cli's `dpm++2m` spelling so the advertised
+  DPM++ 2M choice is accepted rather than rejected or silently replaced with Euler.
+- **Managed mesh-only Finish.** Durable preparation records the native no-picture settings
+  before acceptance. A separately qualified `finish:mesh` capability permits classic Blender
+  cleanup/baking/compression without authorizing photo projection, Hero or Pixal replay.
+- **Managed artifact and operation policy.** Downloads use owner-routed URLs; remote
+  show-in-folder and credential persistence are refused. Studio exposes worker capability
+  policy separately from installed-engine metadata.
+- **Skin export publication.** Dressed/variant exports retain owner-namespaced completed
+  bundles and provenance; a failed rebuild revokes publication without deleting the last export.
 - **Auto-rig setup works on Windows.** It looked for Python in the wrong folder and stopped
   before installing anything.
 - **A failed Finish clean-up shows its real error** in the bug report, not just an exit code.

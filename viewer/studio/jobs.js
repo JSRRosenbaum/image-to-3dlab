@@ -1,3 +1,4 @@
+import { apiFetch as fetch } from './managed.js';
 // Running a step: start a job, follow it, report progress, a live log, and how it ended.
 // Every step's API answers a start with {job_id, status_url | events_url} and its status
 // endpoint with {status, last_event, log_tail}; this follows any of them the same way.
@@ -33,7 +34,7 @@ export function percentOf(event) {
 /** Turn a raw failure into words a person can act on. */
 /** Copy a failure to paste elsewhere, scrubbed by the server exactly as a bug report is, so no
  *  path carries the person's user name. Nothing is copied if the server can't scrub it. */
-export async function copyDetails(why, log = '', { send = globalThis.fetch, clipboard = globalThis.navigator?.clipboard } = {}) {
+export async function copyDetails(why, log = '', { send = fetch, clipboard = globalThis.navigator?.clipboard } = {}) {
   const details = String(log || '').slice(-30000);   // the server takes 64 kB; the end explains the failure
   const response = await send('/api/bug-report', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ message: String(why || '').trim() || 'A step failed', details }) });

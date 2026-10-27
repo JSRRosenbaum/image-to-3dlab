@@ -18,6 +18,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 from image_to_3dlab import processes
+from image_to_3dlab.job_admission import command_prefix as admission_prefix
 from image_to_3dlab.blender import find_blender
 from image_to_3dlab.rig_sidecar import (
     load_sidecar,
@@ -26,6 +27,8 @@ from image_to_3dlab.rig_sidecar import (
     verify_scene,
 )
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from completion_api import complete, host_name
 OUTPUT_ROOT = REPO / "output" / "rig-rebind"
 WORKER = REPO / "scripts" / "blender_rebind.py"
 JOB_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -39,6 +42,13 @@ ARTIFACTS = {
 
 
 def blender_executable() -> Path | None:
+    # Rigify profiles pin a different Blender line than Finish/SkinTokens. Keep
+    # that host-local choice isolated; a bad explicit path must never fall back.
+    if "I2L_REBIND_BLENDER" in os.environ:
+        configured = os.environ["I2L_REBIND_BLENDER"].strip()
+        if not configured:
+            return None
+        return find_blender(env={**os.environ, "I2L_BLENDER": configured})
     return find_blender()
 
 
@@ -85,7 +95,7 @@ class RigJobManager:
             active = self.jobs.get(self.active) if self.active else None
             if active is not None and active.status not in TERMINAL:
                 raise RuntimeError("a rig rebind is already running")
-            stem = _slug(Path(asset_name).stem)
+            stem = host_name(_slug(Path(asset_name).stem))
             stamp = time.strftime("%Y%m%d-%H%M%S")
             directory = self.output_root / f"{stem}__rebind__{stamp}"
             suffix = 2
@@ -145,8 +155,10 @@ def run_job(job: RigJob, manager: RigJobManager = RIG_JOBS) -> None:
     try:
         job.status = "running"
         job.emit({"phase": "validate", "overall_pct": 5, "message": "Inputs verified"})
+        worker_command = build_command(job, blender)
         job.process = subprocess.Popen(
-            build_command(job, blender), cwd=str(REPO), env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            [*admission_prefix(), *worker_command],
+            cwd=str(REPO), env={**os.environ, "PYTHONUNBUFFERED": "1"},
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
             **processes.group_popen_kwargs(),
         )
@@ -190,6 +202,11 @@ def run_job(job: RigJob, manager: RigJobManager = RIG_JOBS) -> None:
         job.emit({"phase": "error", "message": str(exc)})
     finally:
         job.directory.joinpath("pid").unlink(missing_ok=True)
+        if job.status == "done":
+            try:
+                complete(REPO / "output", job.directory)
+            except Exception as exc:
+                job.append_log(f"completion seal failed: {exc}")
         manager.finish(job)
 
 

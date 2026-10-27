@@ -83,6 +83,25 @@ EDITS: tuple[Edit, ...] = (
          "        num_workers=1 if torch.cuda.is_available() else 0,\n"),
     Edit("demo.py", 'k: v.to("cuda") if isinstance(v, Tensor) else v',
          f"k: v.to({DEVICE}) if isinstance(v, Tensor) else v"),
+    # Keep the helper in the admitted job's process group, including cancellation.
+    Edit("demo.py",
+         '    else:\n        popen_kwargs["preexec_fn"] = os.setsid\n',
+         '    # POSIX: inherit the job process group so cancellation includes this helper.\n'),
+    Edit("demo.py",
+         """\
+            if os.name == "nt":
+                proc.terminate()
+            else:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+""",
+         """\
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+"""),
     # FLASH3 asks nvidia-smi for the card name, which fails without one.
     Edit("src/model/michelangelo/utils/misc.py",
          'self.available = "H100" in get_device_type()',

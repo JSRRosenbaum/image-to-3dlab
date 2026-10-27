@@ -31,7 +31,10 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 from image_to_3dlab import blender as blender_lookup
 from image_to_3dlab import processes
+from image_to_3dlab.job_admission import command_prefix as admission_prefix
 from image_to_3dlab.host import APPLE, host_platform
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from completion_api import complete, host_name, revoke
 
 OUTPUT_ROOT = REPO / "output" / "finish"
 # Where generation runs (and their records) live, for matching an uploaded model to the run
@@ -550,7 +553,7 @@ class FinishJobManager:
             active = self.jobs.get(self.active) if self.active else None
             if active is not None and active.status not in TERMINAL:
                 raise RuntimeError("a finishing job is already running")
-            stem = _slug(Path(asset_name).stem)
+            stem = host_name(_slug(Path(asset_name).stem))
             stamp = time.strftime("%Y%m%d-%H%M%S")
             directory = self.output_root / f"{stem}__finish__{stamp}"
             suffix = 2
@@ -615,6 +618,7 @@ class FinishJobManager:
             job.settings = fit_to_machine(
                 normalise_settings(json.loads(job.settings_path.read_text())))
             job.resume = True
+            revoke(REPO / "output", directory)
             self.jobs[job.id] = job
             self.active = job.id
             return job
@@ -658,8 +662,10 @@ def run_job(job: FinishJob, manager: FinishJobManager = FINISH_JOBS) -> None:  #
             message = "Starting"
         job.emit({"phase": "queued", "overall_pct": 0, "stages": stages, "message": message})
         progress = FinishProgress(stages)
+        worker_command = (hero_command(job, job.settings) if hero else
+                          build_command(job, job.settings, resume=job.resume))
         job.process = subprocess.Popen(
-            hero_command(job, job.settings) if hero else build_command(job, job.settings, resume=job.resume),
+            [*admission_prefix(), *worker_command],
             cwd=str(REPO),
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
@@ -712,6 +718,11 @@ def run_job(job: FinishJob, manager: FinishJobManager = FINISH_JOBS) -> None:  #
         job.emit({"phase": "error", "message": str(exc)})
     finally:
         job.directory.joinpath("pid").unlink(missing_ok=True)
+        if job.status == "done":
+            try:
+                complete(REPO / "output", job.directory)
+            except Exception as exc:
+                job.append_log(f"completion seal failed: {exc}")
         manager.finish(job)
 
 

@@ -1,3 +1,4 @@
+import { apiFetch as fetch } from './managed.js';
 // Activity and About: quiet sheets over the viewer. Activity is the full history of every
 // step that ended (finished, stopped or failed), newest first; failures live here, not in
 // the way. About says what this is, who built what, and where to find us.

@@ -4,8 +4,8 @@ A skin starts from a finished Pixal3D model. The person says what to change ("ma
 skirt gold"), Qwen edits the model's own front picture, and they approve it or ask again
 with changes; then the same for the back picture when the model was built from one. Once
 both are approved, Pixal3D repaints the model's saved shape from the new pictures and
-Finish runs with the model's own settings. Mesh, UVs and normal map come out identical to
-the original, so the rig and moves made for it fit every skin.
+Finish prepares the new paint. A final bake transfers it onto the original UVs;
+only colour and metallic-roughness images change, so existing rigs and moves still fit.
 
 Everything a skin makes lives in `output/skins/<id>/`: its picture tries, the approved
 pair, the repaint and the finished skin. The Library never mistakes those for new models;
@@ -31,11 +31,14 @@ from typing import Any
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))   # standing alone, not only after another module put it there
 from image_to_3dlab import processes
+from image_to_3dlab.job_admission import command_prefix as admission_prefix
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from completion_api import complete, owner as sync_owner, revoke
 OUTPUT_ROOT = REPO / "output"
 SKINS_DIR = "skins"
 RECORD = "skin.json"
-SKIN_ID = re.compile(r"^[0-9a-f]{12}$")
+SKIN_ID = re.compile(r"^(?:[0-9a-f]{12}|(?:ash|rowan)__[0-9a-f]{12})$")
 SIDES = ("front", "back")
 MAX_INSTRUCTION = 600
 GENERATOR = REPO / "scripts" / "pixal3d_generate.py"
@@ -45,6 +48,7 @@ TERMINAL = {"done", "error", "cancelled"}
 FRONT_SEED, BACK_SEED = 42, 142
 # The repaint's in-between files nobody needs once the skin is finished (~230 MB).
 SCRATCH_SUFFIXES = (".post.bin", ".ply", "_base.png")
+_EXPORT_LOCK = threading.Lock()
 
 
 class SkinError(ValueError):
@@ -144,8 +148,8 @@ def base_from_asset(output: Path, asset: dict[str, Any]) -> dict[str, Any]:
     except (OSError, ValueError):
         raise SkinError("This model's Finish settings were not kept, so a skin could not "
                         "match its shape. Finish it again first.") from None
-    # Pixal3D's own clean-up (a kept dump) and the classic route make different meshes: a skin
-    # must be finished the way its model was, or the rig made for the model would not fit it.
+    # Use the original route for paint preparation; a separate bake preserves the original
+    # mesh and UVs rather than assuming repeated retopology is deterministic.
     native = (finished.parent / "input" / "source.post.bin").is_file()
     return {
         "asset": asset.get("id"), "name": asset.get("name"),
@@ -162,7 +166,7 @@ class Skin:
     name: str
     instruction: str
     base: dict[str, Any]
-    id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    id: str = field(default_factory=lambda: f"{sync_owner()}__{uuid.uuid4().hex[:12]}")
     tries: dict[str, list[dict[str, Any]]] = field(default_factory=lambda: {"front": [], "back": []})
     approved: dict[str, str | None] = field(default_factory=lambda: {"front": None, "back": None})
     status: str = "pictures"          # pictures -> building -> done | error
@@ -370,7 +374,7 @@ def repaint_command(output: Path, skin: Skin, python: str = sys.executable) -> l
 
 
 def finish_command(output: Path, skin: Skin) -> list[str]:
-    """Finish with the model's own settings: same face count, so the same mesh and UVs."""
+    """Prepare the new paint with the model's own Finish settings, not its final topology."""
     import finish_api
 
     folder = output / SKINS_DIR / skin.id
@@ -378,15 +382,28 @@ def finish_command(output: Path, skin: Skin) -> list[str]:
     # the model's own route: no dump handed over when the model was finished without one
     dump = repaint.with_suffix(".post.bin") if skin.base.get("native", True) else folder / "no-dump"
     job = SimpleNamespace(asset_path=repaint, image_path=_inside(output, skin.approved["front"]),
-                          result_glb=folder / finished_name(skin), steps_dir=folder / "finish-steps",
+                          result_glb=folder / "finished-paint.glb", steps_dir=folder / "finish-steps",
                           views_dir=repaint.with_suffix(".svviews"), dump_path=dump)
     settings = finish_api.fit_to_machine(finish_api.normalise_settings(skin.base["finish"]))
     return finish_api.build_command(job, settings)
 
 
+def _bake_command(output: Path, skin: Skin) -> list[str]:
+    from image_to_3dlab.blender import find_blender, missing_help
+
+    blender = find_blender()
+    if blender is None:
+        raise RuntimeError(missing_help())
+    folder = output / SKINS_DIR / skin.id
+    return [str(blender), "--background", "--python-exit-code", "1", "--python",
+            str(REPO / "scripts" / "blender_bake_skin.py"), "--",
+            str(folder / "finished-paint.glb"), str(_inside(output, skin.base["finished"])),
+            str(folder / finished_name(skin)), str(int(skin.base["finish"].get("texture_size", 2048)))]
+
+
 @dataclass
 class SkinBuild:
-    """Repaint, then Finish: one job, so nothing else can slip in between the two."""
+    """Repaint, prepare paint, then bake onto the original UVs as one heavy job."""
 
     id: str
     skin_id: str
@@ -446,6 +463,7 @@ class SkinBuilds:
                 raise RuntimeError("a skin is already being made; wait for it to finish")
             job = SkinBuild(uuid.uuid4().hex, skin.id)
             self.jobs[job.id] = job
+            revoke(self.store.output, self.store.folder(skin.id))
             self.active = job.id
         skin.status, skin.error = "building", None
         self.store.save(skin)
@@ -479,14 +497,21 @@ class SkinBuilds:
             # Each command is built when its step starts: Finish only finds the repaint's clean-up
             # dump and cameras once the repaint has written them (2026-10-19: built up front, the
             # first skin took the classic route without Pixel Match, a different mesh).
-            for stage, make in (("repaint", repaint_command), ("finish", finish_command)):
+            for stage, make in (("repaint", repaint_command), ("finish", finish_command),
+                                ("skin-bake", _bake_command)):
                 if job.cancel_requested:
                     raise InterruptedError
                 command = make(output, skin)
-                job.emit({"phase": stage, "message": "Repainting the model" if stage == "repaint"
-                          else "Finishing, with the model's own settings", "overall_pct": 0 if stage == "repaint" else 80})
-                job.process = runner(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     text=True, bufsize=1, cwd=str(REPO), **processes.group_popen_kwargs())
+                message, percent = {
+                    "repaint": ("Repainting the model", 0),
+                    "finish": ("Preparing the new paint", 80),
+                    "skin-bake": ("Baking paint onto the original mesh and UVs", 98),
+                }[stage]
+                job.emit({"phase": stage, "message": message, "overall_pct": percent})
+                job.process = runner(
+                    [*admission_prefix(), *command], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1, cwd=str(REPO), **processes.group_popen_kwargs(),
+                )
                 if job.cancel_requested:            # Cancel landed while it started: it found no process to stop
                     self.stop(job.process.pid)
                 for raw in job.process.stdout:
@@ -504,7 +529,7 @@ class SkinBuilds:
                     raise RuntimeError(f"the {stage} step stopped (exit {code})")
             result = folder / finished_name(skin)
             if not result.is_file():
-                raise RuntimeError("Finish ended without writing the skin")
+                raise RuntimeError("The final paint bake ended without writing the skin")
             for leftover in (folder / "repaint").glob("*"):
                 if leftover.name.endswith(SCRATCH_SUFFIXES):
                     leftover.unlink(missing_ok=True)
@@ -522,6 +547,11 @@ class SkinBuilds:
         finally:
             self.store.save(skin)
             self._history(job, skin)
+            if job.status == "done":
+                try:
+                    complete(output, folder)
+                except Exception as exc:
+                    job.log_lines.append(f"completion seal failed: {exc}")
             with self.lock:
                 if self.active == job.id:
                     self.active = None
@@ -571,17 +601,20 @@ def dressed(output: Path, skin: Skin, file: str) -> str:
 
     key = hashlib.sha1(file.encode()).hexdigest()[:10]
     target = output / SKINS_DIR / skin.id / "dressed" / f"{key}__{source.name}"
-    if not _fresh(target, source, paint):
-        target.parent.mkdir(parents=True, exist_ok=True)
-        partial = target.with_suffix(".part")
-        partial.write_bytes(dress(source.read_bytes(), paint.read_bytes()))
-        partial.replace(target)
+    with _EXPORT_LOCK:
+        if not _fresh(target, source, paint):
+            revoke(output, output / SKINS_DIR / skin.id)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            partial = target.with_suffix(".part")
+            partial.write_bytes(dress(source.read_bytes(), paint.read_bytes()))
+            partial.replace(target)
+        complete(output, output / SKINS_DIR / skin.id)
     return _rel(output, target)
 
 
 def all_skins(output: Path, file: str, skins: list[Skin], original: str = "Original paint") -> str:
-    """One GLB of `file` with its own paint and every one of `skins` as a named variant, kept in
-    output/skins/all/. Remade when the model or any skin changes."""
+    """One GLB of `file` carrying every finished skin in a sealed, owner-namespaced bundle.
+    Remade when the model or any skin changes; older exports remain untouched."""
     _repo_on_path()
     from image_to_3dlab.glb_skins import with_variants
 
@@ -594,15 +627,29 @@ def all_skins(output: Path, file: str, skins: list[Skin], original: str = "Origi
     import hashlib
 
     key = hashlib.sha1("|".join([file, *sorted(s.id for s in done)]).encode()).hexdigest()[:10]
-    target = output / SKINS_DIR / "all" / f"{source.stem[:60]}__skins-{key}.glb"
+    folder = output / SKINS_DIR / f"{sync_owner()}__export-{key}"
+    target = folder / f"{source.stem[:60]}__skins.glb"
     paints = [output / s.result for s in done]
-    if not _fresh(target, source, *paints):
-        target.parent.mkdir(parents=True, exist_ok=True)
-        partial = target.with_suffix(".part")
-        partial.write_bytes(with_variants(source.read_bytes(),
-                                          [(s.name, p.read_bytes()) for s, p in zip(done, paints, strict=True)],
-                                          original=original))
-        partial.replace(target)
+    with _EXPORT_LOCK:
+        if not _fresh(target, source, *paints):
+            revoke(output, folder)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            partial = target.with_suffix(".part")
+            partial.write_bytes(with_variants(source.read_bytes(),
+                                              [(s.name, p.read_bytes()) for s, p in zip(done, paints, strict=True)],
+                                              original=original))
+            try:
+                provenance = json.loads(source.with_suffix(".provenance.json").read_text())
+            except (OSError, ValueError):
+                provenance = None
+            record = folder / "export.provenance.json"
+            record.write_text(json.dumps({
+                "operation": "skin-variants", "source": file,
+                "source_provenance": provenance,
+                "skins": [s.to_dict() for s in done],
+            }, indent=2))
+            partial.replace(target)
+        complete(output, folder)
     return _rel(output, target)
 
 

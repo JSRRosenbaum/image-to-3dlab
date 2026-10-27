@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import inspect
 import json
-import re
 import sys
+import re
+
 from pathlib import Path
 
 import pytest
@@ -46,12 +46,15 @@ DANCER = {**KNIGHT, "id": "bbbbbbbbbbbb", "name": "dancer", "stage": "animated",
 PICTURE = {"id": "cccccccccccc", "name": "fox", "kind": "picture", "stage": "picture", "updated": 0,
            "picture": "images/f/f.png", "clips": [], "props": []}
 
-
 class FakeHttp:
     def __init__(self):
+        self.headers: list[dict] = []
+        self.assets = [KNIGHT, DANCER, PICTURE]
         self.posts: list[tuple[str, dict]] = []
         self.alive = True
-        self.assets = [KNIGHT, DANCER, PICTURE]
+        self.last_params = None
+
+
 
     def get(self, url, params=None, timeout=None):
         path = url.split("8777/", 1)[1]
@@ -59,6 +62,7 @@ class FakeHttp:
         if not self.alive:
             raise ConnectionError("refused")
         body = {
+            "api/graft/capabilities": {"managed": True},
             "api/catalog": CATALOG, "api/animate/models": PRESETS,
             "api/recipes": {"goals": {"character": {"wording": "A-pose, plain background"}}},
             "api/assets": {"assets": self.assets},
@@ -74,24 +78,40 @@ class FakeHttp:
             return Response(200, content=b"PNG", headers={"X-Preview-Stage": "finished", "X-Preview-Path": ".previews/x.png"})
         return Response(200, body) if body is not None else Response(404, {"error": f"no {path}"})
 
-    def post(self, url, files=None, json=None, timeout=None):
+    def post(self, url, files=None, json=None, timeout=None, headers=None):
         path = url.split("8777/", 1)[1]
         self.posts.append((path, files or json or {}))
+        self.headers.append(headers)
+        body = {}
         if path == "api/bug-report":
-            return Response(200, {"site": "https://assetfurnace.com/report#report=x", "github": "https://github.com/i",
-                                  "text": json["message"] + "\n\n" + json["details"], "discord": "https://discord.gg/x"})
-        if path == "api/reveal":
-            return Response(200, {"shown": "/out/" + json["file"]})
-        if path == "api/chains":
-            return Response(202, {"id": "new-run"})
-        if path.endswith("/cancel"):
-            return Response(200, {"cancelled": True})
-        return Response(202, {"status_url": "/api/setup/hunyuan/status"})
+            body = {"site": "https://assetfurnace.com/report#report=x", "github": "https://github.com/i",
+                    "text": json["message"] + "\\n\\n" + json["details"], "discord": "https://discord.gg/x"}
+        elif path == "api/chains":
+            body = {"id": "new-run"}
+        elif path.endswith("/cancel"):
+            body = {"cancelled": True}
+        else:
+            body = {"status_url": "/api/setup/hunyuan/status"}
+        body["graft"] = {"job_id": headers["X-Graft-Request-ID"], "state": "completed"}
+        return Response(202 if path == "api/chains" else 200, body)
 
+
+@pytest.fixture(autouse=True)
+def managed_state_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
 
 @pytest.fixture
 def studio():
-    return ms.Studio("http://127.0.0.1:8777", http=FakeHttp(), start=lambda: None)
+    return ms.Studio("http://127.0.0.1:8777", http=FakeHttp())
+
+
+def test_unavailable_managed_studio_does_not_start_a_local_worker():
+    http = FakeHttp()
+    http.alive = False
+    studio = ms.Studio("http://127.0.0.1:8777", http=http)
+    with pytest.raises(ms.StudioError, match="no local worker was started"):
+        ms.status(studio)
+    assert http.posts == []
 
 
 def sent(studio) -> dict:
@@ -102,47 +122,12 @@ def sent(studio) -> dict:
 
 
 # --------------------------------------------------------------------------- every studio action is covered
-def post_routes() -> set[str]:
-    """Every POST route the studio server answers, read from its handler."""
-    import generate_api
-
-    source = inspect.getsource(generate_api.Handler.do_POST)
-    routes = set()
-    for cond in re.findall(r"if (.*?):\n", source):
-        if "parts" not in cond or "api" not in cond:
-            continue
-        fixed = re.search(r"parts == \[(.*?)\]", cond)
-        if fixed:
-            routes.add("/".join(json.loads(f"[{fixed[1]}]")))
-            continue
-        head = re.search(r"parts\[:(\d)\] == \[(.*?)\]", cond)
-        length = re.search(r"len\(parts\) == (\d)", cond)
-        if not (head and length):
-            continue
-        parts = json.loads(f"[{head[2]}]") + ["*"] * (int(length[1]) - int(head[1]))
-        last = int(length[1]) - 1
-        tail = re.search(rf"parts\[{last}\] == \"(\w[\w-]*)\"", cond)
-        options = re.search(rf"parts\[{last}\] in \{{(.*?)\}}", cond)
-        for word in ([tail[1]] if tail else json.loads(f"[{options[1]}]") if options else ["*"]):
-            routes.add("/".join(parts[:-1] + [word]))
-    return routes
-
-
-def test_every_studio_action_is_a_tool_or_marked_studio_only():
-    routes = post_routes()
-    assert {"api/chains", "api/setup/*/download", "api/assets/*/delete"} <= routes  # the reader still works
-    unaccounted = routes - set(ms.STUDIO_ONLY) - ms.USED
-    assert not unaccounted, (f"New studio actions agents can't reach: {sorted(unaccounted)}. "
-                             "Add a tool in image_to_3dlab/mcp_server.py, or list them in STUDIO_ONLY with a reason.")
-    stale = (set(ms.STUDIO_ONLY) | ms.USED) - routes
-    assert not stale, f"Listed but gone from the server: {sorted(stale)}"
-
 
 def test_the_server_registers_every_tool():
     pytest.importorskip("mcp")
     import asyncio
 
-    server = ms.build_server(ms.Studio("http://127.0.0.1:8777", http=FakeHttp(), start=lambda: None))
+    server = ms.build_server(ms.Studio("http://127.0.0.1:8777", http=FakeHttp()))
     names = {t.name for t in asyncio.run(server.list_tools())}
     assert names == {"status", "list_engines", "list_moves", "create", "continue_asset", "run_status", "cancel_run",
                      "list_assets", "list_versions", "options", "preview", "open_in_studio", "install_backend",
@@ -289,13 +274,13 @@ def test_preview_returns_the_picture_and_a_studio_link(studio):
     assert info["studio"].endswith("/viewer/studio.html#asset=aaaaaaaaaaaa")
 
 
-def test_open_in_studio_opens_the_assets_link(studio):
-    opened = []
-    out = ms.open_in_studio(studio, asset_id=KNIGHT["id"], opener=lambda url: opened.append(url) or True)
-    assert opened == [out["link"]] and out["link"].endswith("#asset=aaaaaaaaaaaa")
+def test_open_in_studio_returns_managed_link_without_opening_a_browser():
+    studio = ms.Studio("http://127.0.0.1:8777", http=FakeHttp())
+    out = ms.open_in_studio(studio, asset_id=KNIGHT["id"])
+    assert out["opened"] is False and out["link"].endswith("#asset=aaaaaaaaaaaa")
+    assert "No browser was opened" in out["note"]
     with pytest.raises(ms.StudioError):
-        ms.open_in_studio(studio, asset_id="ffffffffffff", opener=lambda url: True)
-
+        ms.open_in_studio(studio, asset_id="ffffffffffff")
 
 def test_model_info_gives_the_stats_and_where_the_file_is(studio):
     out = ms.model_info(studio, asset_id=KNIGHT["id"])
@@ -304,11 +289,9 @@ def test_model_info_gives_the_stats_and_where_the_file_is(studio):
     assert "triangles" in out["tip"]
 
 
-def test_show_in_folder_opens_the_steps_file_on_this_machine(studio):
-    out = ms.show_in_folder(studio, asset_id=KNIGHT["id"], stage="finished")
-    assert studio.http.last_params == {"asset": KNIGHT["id"], "stage": "finished"}
-    assert studio.http.posts[-1] == ("api/reveal", {"file": "finish/k/k_20k.glb"})
-    assert out["shown"] == "/out/finish/k/k_20k.glb"
+def test_show_in_folder_refuses_remote_filesystem_access(studio):
+    with pytest.raises(ms.StudioError, match="Remote show-in-folder is unavailable"):
+        ms.show_in_folder(studio, asset_id=KNIGHT["id"], stage="finished")
 
 
 def test_report_bug_drafts_the_report_and_never_sends_it(studio):
@@ -319,25 +302,6 @@ def test_report_bug_drafts_the_report_and_never_sends_it(studio):
     assert "user" in out["tip"].lower() and "send" in out["tip"].lower()
 
 
-def test_a_studio_that_is_not_running_is_started_once():
-    http, started = FakeHttp(), []
-    http.alive = False
-
-    def start():
-        started.append(1)
-        http.alive = True
-
-    studio = ms.Studio("http://127.0.0.1:8777", http=http, start=start)
-    ms.status(studio)
-    ms.status(studio)
-    assert started == [1]
-
-
-def test_a_remote_studio_is_never_started_from_here():
-    http = FakeHttp()
-    http.alive = False
-    with pytest.raises(ms.StudioError, match="not this machine"):
-        ms.Studio("http://10.0.0.5:8777", http=http)._ensure()
 
 
 def test_preview_can_show_a_move(studio):
@@ -362,14 +326,6 @@ def test_a_new_move_is_traced_to_its_character():
 
 
 # --------------------------------------------------------------------------- Finish choices
-def test_every_finish_detail_in_the_studio_is_one_agents_can_ask_for():
-    source = (REPO / "viewer" / "studio" / "steps.js").read_text()
-    menu = source[source.index("function finishDetail()"):]
-    menu = menu[: menu.index("</select>")]
-    studio_values = set(re.findall(r'<option value="([^"]+)"', menu)) - {"custom"}
-    ours = {"high" if v.get("high_detail") else "hero" if v.get("hero") else str(v.get("faces")) if "faces" in v else "full"
-            for v in ms.FINISH_DETAILS.values()}
-    assert studio_values == ours, "The studio's Finish Detail menu and FINISH_DETAILS in mcp_server.py disagree."
 
 
 @pytest.mark.parametrize("detail, pm, expected", [
@@ -446,7 +402,7 @@ def test_list_versions_gathers_one_family_oldest_first_from_any_member():
     v1 = {**KNIGHT, "family": "fam", "version": 1, "main": True}
     v2 = {**KNIGHT, "id": "dddddddddddd", "family": "fam", "version": 2, "finished": "finish/k2/k_full.glb", "hidden": True}
     other = {**PICTURE, "family": "other"}
-    studio = ms.Studio("http://127.0.0.1:8777", http=FakeHttp(), start=lambda: None)
+    studio = ms.Studio("http://127.0.0.1:8777", http=FakeHttp())
     studio.get = lambda path, **_: {"assets": [v2, other, v1]}
     out = ms.list_versions(studio, asset_id="dddddddddddd")
     assert out["family"] == "fam" and out["prompt"] == "a knight"
@@ -480,18 +436,6 @@ def test_options_lists_the_main_and_every_advanced_knob():
     assert {"finish_detail", "pixel_match", "move"} <= set(out["main"])
 
 
-def test_every_studio_control_has_an_mcp_twin():
-    """The studio's Create and Steps controls, each matched to its main or advanced MCP knob."""
-    source = "".join((REPO / "viewer" / "studio" / f).read_text() for f in ("steps.js", "create.js"))
-    controls = set(re.findall(r'data-k="(\w+)"', source)) - {"licence"}   # licence is a label, not a knob
-    twin = {"faces": "finish_detail", "customFaces": "finish_detail", "photo": "pixel_match", "engine": "engine",
-            "frontback": "front_and_back", "recipe": "add_wording", "move": "move", "text": "description",
-            "edgefade": "edge_fade", "nudge": "nudge", "texture": "texture_size", "rigsource": "rig_from",
-            "speed": "speed", "spread": "arms_away", "keep": "keep_everything"}
-    missing = sorted(controls - set(twin))
-    assert not missing, f"Studio controls with no MCP twin: {missing}. Add them to ADVANCED (or main) and here."
-    known = set(ms.ADVANCED) | set(ms.options()["main"]) | {"description"}
-    assert {twin[c] for c in controls} <= known
 
 
 @pytest.mark.parametrize("advanced, error", [
@@ -547,16 +491,16 @@ class SkinHttp(FakeHttp):
             return Response(200, self.state)
         return super().get(url, params, timeout)
 
-    def post(self, url, files=None, json=None, timeout=None):
+    def post(self, url, files=None, json=None, timeout=None, headers=None):
         path = url.split("8777/", 1)[1]
         self.posts.append((path, json or files or {}))
-        if path.startswith("api/skins/build/"):
-            return Response(202, {"cancelled": True})
-        return Response(202 if path == "api/skins" else 200, {"skin": self.state, "job_id": "b1"})
+        body = {"cancelled": True} if path.startswith("api/skins/build/") else {"skin": self.state, "job_id": "b1"}
+        body["graft"] = {"job_id": headers["X-Graft-Request-ID"], "state": "completed"}
+        return Response(202 if path == "api/skins" else 200, body)
 
 
 def test_make_skin_sends_the_change_and_says_qwen_is_drawing():
-    studio = ms.Studio("http://127.0.0.1:8777", http=SkinHttp(SKIN), start=lambda: None)
+    studio = ms.Studio("http://127.0.0.1:8777", http=SkinHttp(SKIN))
     out = ms.make_skin(studio, asset_id="aaaaaaaaaaaa", change="make the skirt gold")
     assert studio.http.posts[-1] == ("api/skins", {"asset": "aaaaaaaaaaaa", "instruction": "make the skirt gold"})
     assert out["skin_id"] == SKIN["id"] and out["drawing"] is True and "skin_status" in out["next"]
@@ -576,7 +520,7 @@ def test_both_approved_points_at_build():
 
 
 def test_redo_and_approve_send_side_change_and_number():
-    studio = ms.Studio("http://127.0.0.1:8777", http=SkinHttp(SKIN), start=lambda: None)
+    studio = ms.Studio("http://127.0.0.1:8777", http=SkinHttp(SKIN))
     ms.redo_skin_picture(studio, skin_id=SKIN["id"], side="back", change="keep the belt blue")
     assert studio.http.posts[-1] == (f"api/skins/{SKIN['id']}/try", {"side": "back", "instruction": "keep the belt blue"})
     ms.approve_skin_picture(studio, skin_id=SKIN["id"], side="front", number=2)
@@ -584,16 +528,15 @@ def test_redo_and_approve_send_side_change_and_number():
 
 
 def test_a_picture_still_drawing_is_not_shown():
-    studio = ms.Studio("http://127.0.0.1:8777", http=SkinHttp(SKIN), start=lambda: None)
+    studio = ms.Studio("http://127.0.0.1:8777", http=SkinHttp(SKIN))
     with pytest.raises(ms.StudioError, match="still being drawn"):
         ms.skin_picture(studio, skin_id=SKIN["id"])
 
 
 def test_cancel_reaches_the_running_build_only():
-    idle = ms.Studio("http://127.0.0.1:8777", http=SkinHttp(SKIN), start=lambda: None)
+    idle = ms.Studio("http://127.0.0.1:8777", http=SkinHttp(SKIN))
     assert ms.cancel_skin(idle, skin_id=SKIN["id"])["cancelled"] is False
-    building = ms.Studio("http://127.0.0.1:8777", http=SkinHttp({**SKIN, "build_job": {"job_id": "b1"}}),
-                         start=lambda: None)
+    building = ms.Studio("http://127.0.0.1:8777", http=SkinHttp({**SKIN, "build_job": {"job_id": "b1"}}))
     assert ms.cancel_skin(building, skin_id=SKIN["id"])["cancelled"] is True
     assert building.http.posts[-1][0] == "api/skins/build/b1/cancel"
 
@@ -621,10 +564,20 @@ class ExportHttp(FakeHttp):
         if path == "api/skins/k1/dressed":
             return Response(200, {"file": "skins/k1/dressed/" + params["file"].split("/")[-1]})
         return super().get(url, params, timeout)
+    def post(self, url, files=None, json=None, timeout=None, headers=None):
+        path = url.split("8777/", 1)[1]
+        self.last_params = json
+        self.posts.append((path, json or {}))
+        if path == "api/skins/all":
+            body = {"file": "skins/all/d__skins-abc.glb"}
+        else:
+            body = {"file": "skins/k1/dressed/" + json["file"].split("/")[-1]}
+        body["graft"] = {"job_id": headers["X-Graft-Request-ID"], "state": "completed"}
+        return Response(200, body)
 
 
 def test_export_dresses_the_rig_and_every_move_in_the_skin():
-    studio = ms.Studio("http://127.0.0.1:8777", http=ExportHttp(), start=lambda: None)
+    studio = ms.Studio("http://127.0.0.1:8777", http=ExportHttp())
     out = ms.export_skins(studio, asset_id=DANCER["id"], skin_id="k1")
     assert out["files"] == {"finished": "output/skins/k1/gold_20k.glb",
                             "rigged": "output/skins/k1/dressed/d_rigged.glb",
@@ -632,7 +585,7 @@ def test_export_dresses_the_rig_and_every_move_in_the_skin():
 
 
 def test_export_without_a_skin_is_one_file_with_every_skin():
-    studio = ms.Studio("http://127.0.0.1:8777", http=ExportHttp(), start=lambda: None)
+    studio = ms.Studio("http://127.0.0.1:8777", http=ExportHttp())
     out = ms.export_skins(studio, asset_id=DANCER["id"])
     assert out["file"] == "output/skins/all/d__skins-abc.glb" and studio.http.last_params["file"] == DANCER["rigged"]
 

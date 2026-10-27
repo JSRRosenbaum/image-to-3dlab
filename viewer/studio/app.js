@@ -1,7 +1,8 @@
+import { apiFetch as fetch, apiUrl } from './managed.js';
 // AssetFurnace studio: Library | one viewer | Steps.
 // Steps run here through the server's job APIs, prop-sheet splitting included.
 
-import { STEPS, stepCount, stepDone, stepState, statusText, displayModel, stepFile, canViewStep, servedUrl, visibleFamilies, madeVersion, engineOf, engineChoices, openingView, isModelFile, duration, canViewPictures, sizeText, deletionWords, linkedAssetId, statsRows, canReveal } from './library.js';
+import { STEPS, stepCount, stepDone, stepState, statusText, displayModel, stepFile, canViewStep, servedUrl, visibleFamilies, madeVersion, engineOf, engineChoices, openingView, isModelFile, duration, canViewPictures, sizeText, deletionWords, linkedAssetId, statsRows } from './library.js';
 import { createStudioViewer } from './viewer.js';
 import { readyEngines, readableLog, copyDetails } from './jobs.js';
 import { stepBody, wireStep } from './steps.js';
@@ -57,7 +58,7 @@ const fileName = (relative) => relative?.split('/').pop() ?? '';
 function assetButton(asset, { sub = false } = {}) {
   const pips = STEPS.slice(0, stepCount(asset)).map((step) => `<i class="${stepDone(asset, step.id) ? 'done' : ''}"></i>`).join('');
   // a small server-made copy, not the full picture (often a megabyte each)
-  const thumb = asset.picture ? `<img src="/api/thumb?path=${encodeURIComponent(asset.picture)}" alt="" loading="lazy">` : `<img class="mark" src="${LOGO}" alt="">`;
+  const thumb = asset.picture ? `<img src="${apiUrl('/api/thumb')}?path=${encodeURIComponent(asset.picture)}" alt="" loading="lazy">` : `<img class="mark" src="${LOGO}" alt="">`;
   const when = new Date(asset.updated * 1000).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
   const name = sub ? `v${asset.version} · ${statusText(asset)}` : asset.name;
   return `<button class="asset${sub ? ' sub' : ''}${asset.hidden ? ' is-hidden' : ''}" data-id="${escape(asset.id)}" title="${escape(when)}" aria-current="${!viewingMaking && asset === current}">
@@ -85,7 +86,7 @@ function renderLibrary() {
   }).join('') : `<li class="empty-lib">${assets.length ? 'Nothing matches.' : 'No assets yet. Press + Create to make your first.'}</li>`)
     + (more ? `<li><button class="ghost more" id="showMore">Show ${Math.min(more, 30)} more of ${more}</button></li>` : '');
   const shown = assets.filter((a) => !a.hidden).length;
-  $('libFoot').textContent = `${shown} asset${shown === 1 ? '' : 's'} · saved in output/ on this machine`;
+  $('libFoot').textContent = `${shown} asset${shown === 1 ? '' : 's'} · managed worker library`;
   document.querySelector('.hidden-toggle').hidden = !hiddenCount && !showHidden;
   $('hiddenLabel').textContent = `Show hidden (${assets.filter((a) => a.hidden).length})`;
   $('showMore')?.addEventListener('click', () => { limit += 30; renderLibrary(); });
@@ -162,7 +163,9 @@ const skinCtx = {
     viewingPictures = false;
     if (asset.rigged && asset.clips.length) {
       // a character: its rest pose and every move, each wearing the skin (made once, then kept)
-      const dress = async (file) => (await (await fetch(`/api/skins/${skin.id}/dressed?file=${encodeURIComponent(file)}`)).json()).file;
+      const dress = async (file) => (await (await fetch(`/api/skins/${skin.id}/dressed`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ file }),
+      })).json()).file;
       try {
         const rest = await dress(asset.rigged);
         const clips = [];
@@ -234,16 +237,12 @@ async function showModelInfo(file) {
     return `<div${classes ? ` class="${classes}"` : ''}${tips[label] ? ` data-tip="${escape(tips[label])}"` : ''}><dt>${escape(label)}</dt><dd>${escape(value)}</dd></div>`;
   }).join('');
   stats.hidden = !info.stats;
-  $('revealBtn').hidden = !canReveal(location.hostname);
+  $('revealBtn').hidden = true;
   $('fileCard').hidden = false;
   actions.dataset.file = info.file;
-  actions.dataset.path = info.path;
+  actions.dataset.path = new URL(url(file), location.href).href;
 }
 
-$('revealBtn').addEventListener('click', () => {
-  fetch('/api/reveal', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ file: $('fileActions').dataset.file }) });
-});
 
 $('copyPathBtn').addEventListener('click', async (event) => {
   const button = event.currentTarget;
@@ -253,7 +252,7 @@ $('copyPathBtn').addEventListener('click', async (event) => {
   } catch {
     button.textContent = 'Copy failed';
   }
-  setTimeout(() => { button.textContent = 'Copy path'; }, 1500);
+  setTimeout(() => { button.textContent = 'Copy download link'; }, 1500);
 });
 
 // what the step actions need from the page

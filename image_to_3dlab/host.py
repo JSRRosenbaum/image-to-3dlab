@@ -342,6 +342,9 @@ def build_jobs(cpus: int | None = None, memory_bytes: int | None = None,
     if cpus is None and memory_bytes is None:
         cpus = cgroup_cpus() or os.cpu_count()
         memory_bytes = cgroup_memory() or total_memory()
+        if limit := os.environ.get("MAX_JOBS"):
+            requested = int(limit)
+            cpus = min(cpus, requested) if cpus is not None else requested
     by_memory = memory_bytes // per_job_bytes if memory_bytes else None
     limits = [n for n in (cpus, by_memory) if n is not None]
     return max(1, min(limits, default=1))

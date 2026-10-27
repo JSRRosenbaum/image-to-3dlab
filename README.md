@@ -12,7 +12,8 @@ NVIDIA PC, with the licence of every asset written down.</p>
   <a href="https://assetfurnace.com/blog/how-to-use-assetfurnace"><b>Step-by-step guide</b></a> ·
   <a href="https://discord.gg/3D4bcEhGx"><b>Join the Discord</b></a> ·
   <a href="https://x.com/bingeljell">X @bingeljell</a> ·
-  <a href="https://github.com/Bingeljell/image-to-3dlab/discussions">Discussions</a>
+  <a href="https://github.com/Bingeljell/image-to-3dlab/discussions">Discussions</a> ·
+  <a href="docs/managed-graft.md">Managed Graft integration</a>
 </p>
 
 <p align="center"><sub>Formerly <i>Image to 3D Lab</i>. Same repo, new name.</sub></p>
